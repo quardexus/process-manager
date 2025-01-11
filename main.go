@@ -60,6 +60,38 @@ func (ni newProcessItem) Description() string { return "" }
 func (ni newProcessItem) FilterValue() string { return "" }
 
 // -----------------------------------------------------------------------------
+// Кастомный делегат для списка с вторым столбцом
+// -----------------------------------------------------------------------------
+
+type customDelegate struct {
+	list.DefaultDelegate
+	selectionColumn int
+}
+
+func (d customDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	item, ok := listItem.(processListItem)
+	if !ok {
+		// Для элементов, отличных от processListItem, используем поведение по умолчанию
+		d.DefaultDelegate.Render(w, m, index, listItem)
+		return
+	}
+
+	str := item.Title()
+	// Добавляем крестик во второй столбец, если он активен
+	if d.selectionColumn == 1 {
+		str += "   [x]" // отступ перед крестиком
+	}
+
+	var out string
+	if index == m.Index() {
+		out = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(str)
+	} else {
+		out = str
+	}
+	fmt.Fprintln(w, out)
+}
+
+// -----------------------------------------------------------------------------
 // States
 // -----------------------------------------------------------------------------
 
@@ -95,20 +127,20 @@ type model struct {
 	justEnteredLogs bool
 	program         *tea.Program
 
+	// Храним наш кастомный делегат в модели
+	delegate        customDelegate
+	selectionColumn int
+
 	// We store current window size
 	windowWidth  int
 	windowHeight int
 }
 
 // -----------------------------------------------------------------------------
-// We'll keep up to maxLogLines lines per process
+// Константы и функции (оставляем без изменений)
 // -----------------------------------------------------------------------------
 
 const maxLogLines = 1000
-
-// -----------------------------------------------------------------------------
-// Periodic tick
-// -----------------------------------------------------------------------------
 
 type tickMsg time.Time
 
@@ -117,10 +149,6 @@ func tickCmd() tea.Cmd {
 		return tickMsg(t)
 	})
 }
-
-// -----------------------------------------------------------------------------
-// Load/save config
-// -----------------------------------------------------------------------------
 
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -150,10 +178,6 @@ func createDefaultConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// -----------------------------------------------------------------------------
-// Helper function to append a log line with limit
-// -----------------------------------------------------------------------------
-
 func appendLog(p *ProcessItem, line string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -162,10 +186,6 @@ func appendLog(p *ProcessItem, line string) {
 		p.Logs = p.Logs[len(p.Logs)-maxLogLines:]
 	}
 }
-
-// -----------------------------------------------------------------------------
-// Start process
-// -----------------------------------------------------------------------------
 
 func startProcess(program *tea.Program, processIndex int, cmdLine string) (*ProcessItem, error) {
 	parts := strings.Fields(cmdLine)
@@ -211,10 +231,6 @@ func startProcess(program *tea.Program, processIndex int, cmdLine string) (*Proc
 	return pItem, nil
 }
 
-// -----------------------------------------------------------------------------
-// Reading output (limit logs to maxLogLines)
-// -----------------------------------------------------------------------------
-
 func (p *ProcessItem) readOutput(program *tea.Program, processIndex int, r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
@@ -232,10 +248,6 @@ func (p *ProcessItem) readOutput(program *tea.Program, processIndex int, r io.Re
 		}
 	}
 }
-
-// -----------------------------------------------------------------------------
-// Initialize model
-// -----------------------------------------------------------------------------
 
 func initialModel(program *tea.Program) model {
 	exePath, err := os.Executable()
@@ -265,14 +277,20 @@ func initialModel(program *tea.Program) model {
 		processes = append(processes, pItem)
 	}
 
+	// Инициализируем кастомный делегат с начальным столбцом 0
+	delegate := customDelegate{
+		DefaultDelegate: list.NewDefaultDelegate(),
+		selectionColumn: 0,
+	}
+
 	var items []list.Item
 	for _, pr := range processes {
 		items = append(items, processListItem{p: pr})
 	}
 	items = append(items, newProcessItem{})
 
-	l := list.New(items, list.NewDefaultDelegate(), 50, 12)
-	l.Title = "Quardexus Process Manager v0.1"
+	l := list.New(items, delegate, 50, 12)
+	l.Title = "Quardexus Process Manager v0.2"
 	l.SetShowHelp(true)
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(true)
@@ -298,6 +316,8 @@ func initialModel(program *tea.Program) model {
 		configPath:          configPath,
 		justEnteredLogs:     false,
 		program:             program,
+		delegate:            delegate,
+		selectionColumn:     0,
 		windowWidth:         0,
 		windowHeight:        0,
 	}
@@ -313,13 +333,47 @@ func (m model) Init() tea.Cmd {
 	)
 }
 
-// killAllProcesses kills all unfinished processes before quitting
 func (m model) killAllProcesses() {
 	for _, pItem := range m.processes {
 		if !pItem.Finished && pItem.Cmd != nil && pItem.Cmd.Process != nil {
 			_ = pItem.Cmd.Process.Kill()
 			appendLog(pItem, "[Process killed by exit]")
 		}
+	}
+}
+
+func (m *model) removeProcess(index int) {
+	if index < 0 || index >= len(m.processes) {
+		return
+	}
+	// Завершаем процесс, если он ещё работает
+	proc := m.processes[index]
+	if !proc.Finished && proc.Cmd != nil && proc.Cmd.Process != nil {
+		_ = proc.Cmd.Process.Kill()
+		appendLog(proc, "[Process killed for removal]")
+	}
+
+	// Удаляем из среза процессов
+	m.processes = append(m.processes[:index], m.processes[index+1:]...)
+
+	// Обновляем список элементов
+	var newItems []list.Item
+	for _, pr := range m.processes {
+		newItems = append(newItems, processListItem{p: pr})
+	}
+	newItems = append(newItems, newProcessItem{})
+	m.list.SetItems(newItems)
+
+	// Обновляем конфигурацию
+	cfg, err := loadConfig(m.configPath)
+	if err == nil {
+		// Перестраиваем список команд из текущих процессов
+		var cmds []string
+		for _, p := range m.processes {
+			cmds = append(cmds, p.CmdLine)
+		}
+		cfg.Processes = cmds
+		_ = saveConfig(m.configPath, cfg)
 	}
 }
 
@@ -337,33 +391,71 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.killAllProcesses()
 				return m, tea.Quit
 
+			case "right":
+				m.selectionColumn = 1
+				m.delegate.selectionColumn = 1
+				m.list.SetDelegate(m.delegate)
+				return m, nil
+
+			case "left":
+				m.selectionColumn = 0
+				m.delegate.selectionColumn = 0
+				m.list.SetDelegate(m.delegate)
+				return m, nil
+
 			case "enter":
-				idx := m.list.Index()
-				itm := m.list.Items()[idx]
-
-				switch itm.(type) {
-				case newProcessItem:
-					m.state = stateAddProcess
-					m.textInput.SetValue("")
-					return m, nil
-
-				case processListItem:
-					m.currentProcessIndex = idx
-					m.state = stateViewLogs
-					m.justEnteredLogs = true
-
-					if m.windowWidth > 0 && m.windowHeight > 0 {
-						m.viewport.Width = m.windowWidth
-						m.viewport.Height = m.windowHeight - 5
+				// Если выбран второй столбец и элемент - процесс, завершаем и удаляем
+				if m.selectionColumn == 1 {
+					idx := m.list.Index()
+					if idx >= 0 && idx < len(m.list.Items()) {
+						switch m.list.Items()[idx].(type) {
+						case processListItem:
+							m.removeProcess(idx)
+							// Сброс столбца после удаления
+							m.selectionColumn = 0
+							m.delegate.selectionColumn = 0
+							m.list.SetDelegate(m.delegate)
+							return m, nil
+						case newProcessItem:
+							// Если выбран "[Create a new process]", переходим к его созданию
+							m.state = stateAddProcess
+							m.textInput.SetValue("")
+							return m, nil
+						}
 					}
+				} else {
+					// Обычное поведение Enter в первом столбце
+					idx := m.list.Index()
+					if idx < 0 || idx >= len(m.list.Items()) {
+						return m, nil
+					}
+					itm := m.list.Items()[idx]
 
-					p := m.processes[m.currentProcessIndex]
-					now := time.Now().Format("2006-01-02 15:04:05")
-					appendLog(p, fmt.Sprintf("%s [Logs window opened: %s]", now, p.CmdLine))
+					switch itm.(type) {
+					case newProcessItem:
+						m.state = stateAddProcess
+						m.textInput.SetValue("")
+						return m, nil
 
-					m = m.updateLogsViewport(true)
-					return m, nil
+					case processListItem:
+						m.currentProcessIndex = idx
+						m.state = stateViewLogs
+						m.justEnteredLogs = true
+
+						if m.windowWidth > 0 && m.windowHeight > 0 {
+							m.viewport.Width = m.windowWidth
+							m.viewport.Height = m.windowHeight - 5
+						}
+
+						p := m.processes[m.currentProcessIndex]
+						now := time.Now().Format("2006-01-02 15:04:05")
+						appendLog(p, fmt.Sprintf("%s [Logs window opened: %s]", now, p.CmdLine))
+
+						m = m.updateLogsViewport(true)
+						return m, nil
+					}
 				}
+
 			}
 
 		case tickMsg:
@@ -372,7 +464,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.WindowSizeMsg:
 			m.windowWidth = msg.Width
 			m.windowHeight = msg.Height
-			// Dynamically adjust list height based on window size
 			newHeight := msg.Height - 5
 			if newHeight < 3 {
 				newHeight = 3
@@ -405,7 +496,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pItem, err := startProcess(m.program, len(m.processes), cmdLine)
 					if err == nil {
 						m.processes = append(m.processes, pItem)
-						_ = m.addProcessToConfig(cmdLine)
+						// Добавляем новый процесс в конфигурацию
+						cfg, err := loadConfig(m.configPath)
+						if err == nil {
+							cfg.Processes = append(cfg.Processes, cmdLine)
+							_ = saveConfig(m.configPath, cfg)
+						}
 
 						var newItems []list.Item
 						for _, pr := range m.processes {
@@ -570,7 +666,7 @@ func (m model) View() string {
 }
 
 // -----------------------------------------------------------------------------
-// Helper functions
+// Остальные вспомогательные функции без изменений
 // -----------------------------------------------------------------------------
 
 func (m model) updateLogsViewport(forceGotoBottom bool) model {
@@ -595,19 +691,8 @@ func (m model) updateLogsViewport(forceGotoBottom bool) model {
 
 	if forceGotoBottom || m.justEnteredLogs {
 		m.viewport.GotoBottom()
-		return model{
-			state:               m.state,
-			list:                m.list,
-			textInput:           m.textInput,
-			viewport:            m.viewport,
-			processes:           m.processes,
-			currentProcessIndex: m.currentProcessIndex,
-			configPath:          m.configPath,
-			justEnteredLogs:     false,
-			program:             m.program,
-			windowWidth:         m.windowWidth,
-			windowHeight:        m.windowHeight,
-		}
+		m.justEnteredLogs = false
+		return m
 	}
 	if wasAtBottom {
 		m.viewport.GotoBottom()
@@ -617,17 +702,8 @@ func (m model) updateLogsViewport(forceGotoBottom bool) model {
 	return m
 }
 
-func (m *model) addProcessToConfig(cmdLine string) error {
-	cfg, err := loadConfig(m.configPath)
-	if err != nil {
-		return err
-	}
-	cfg.Processes = append(cfg.Processes, cmdLine)
-	return saveConfig(m.configPath, cfg)
-}
-
 func cp866ToUTF8(s string) (string, error) {
-	// Placeholder for codepage conversion
+	// Заглушка для конвертации кодовой страницы
 	return s, nil
 }
 
@@ -645,7 +721,6 @@ func (m *model) SetProgram(p *tea.Program) {
 }
 
 func main() {
-	// Set UTF-8 in Windows console
 	if runtime.GOOS == "windows" {
 		_ = exec.Command("cmd", "/c", "chcp", "65001").Run()
 	}
