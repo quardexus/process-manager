@@ -23,7 +23,7 @@ import (
 )
 
 // -----------------------------------------------------------------------------
-// Глобальная переменная для доступа к модели
+// Global variable to access the model
 // -----------------------------------------------------------------------------
 var globalModel *model
 
@@ -71,7 +71,7 @@ func (ni newProcessItem) Description() string { return "" }
 func (ni newProcessItem) FilterValue() string { return "" }
 
 // -----------------------------------------------------------------------------
-// Кастомный делегат для списка с вторым столбцом
+// Custom delegate for the list with a second column
 // -----------------------------------------------------------------------------
 
 type customDelegate struct {
@@ -146,7 +146,7 @@ type model struct {
 }
 
 // -----------------------------------------------------------------------------
-// Константы и функции
+// Constants and functions
 // -----------------------------------------------------------------------------
 
 const maxLogLines = 1000
@@ -316,7 +316,7 @@ func initialModel(program *tea.Program) model {
 			log.Fatal("Failed to create config:", err)
 		}
 	} else if err != nil {
-		// Если не удалось прочитать существующий конфиг, переименовываем его
+		// If failed to read the existing config, rename it
 		backupPath := configPath + ".old"
 		renameErr := os.Rename(configPath, backupPath)
 		if renameErr != nil {
@@ -351,7 +351,7 @@ func initialModel(program *tea.Program) model {
 	items = append(items, newProcessItem{})
 
 	l := list.New(items, delegate, 50, 12)
-	l.Title = "Quardexus Process Manager v1.0 [beta]"
+	l.Title = "Quardexus Process Manager v1.0 [beta2]"
 	l.SetShowHelp(true)
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(true)
@@ -624,27 +624,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.killAllProcesses()
 				return m, tea.Quit
 
-			case "ctrl+k":
-				if m.currentProcessIndex >= 0 && m.currentProcessIndex < len(m.processes) {
-					proc := m.processes[m.currentProcessIndex]
-					if !proc.Finished && proc.Cmd != nil && proc.Cmd.Process != nil {
-						err := proc.Cmd.Process.Kill()
-						proc.mu.Lock()
-						if err != nil {
-							appendLog(proc, fmt.Sprintf("[Failed to kill process: %v]", err))
-						} else {
-							appendLog(proc, "[Process forcibly killed by user]")
-							proc.Finished = true
-						}
-						proc.mu.Unlock()
-
-						if m.program != nil {
-							m.program.Send(logUpdateMsg{processIndex: m.currentProcessIndex})
-						}
-					}
-				}
-				return m, nil
-
 			case "up", "k":
 				m.viewport.LineUp(1)
 			case "down", "j":
@@ -702,7 +681,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	switch m.state {
 	case stateList:
-		return m.list.View()
+		helpText := "\n\nUse ←/→ to switch between modes. Right arrow: switch to process deletion mode."
+		return m.list.View() + helpText
 
 	case stateAddProcess:
 		checkbox := "[ ]"
@@ -730,7 +710,7 @@ func (m model) View() string {
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
 			fmt.Sprintf("Viewing logs for process '%s' (total lines: %d)", proc.CmdLine, linesCount),
-			"Controls: Esc – back, ↑/↓ – scroll, Home/End – top/bottom, ctrl+k – kill process, q/ctrl+c – quit",
+			"Controls: Esc – back, ↑/↓ – scroll, Home/End – top/bottom, q/ctrl+c – quit",
 			m.viewport.View(),
 		)
 	}
@@ -772,7 +752,7 @@ func (m model) updateLogsViewport(forceGotoBottom bool) model {
 }
 
 func cp866ToUTF8(s string) (string, error) {
-	// Заглушка для конвертации кодовой страницы
+	// Placeholder for code page conversion
 	return s, nil
 }
 
