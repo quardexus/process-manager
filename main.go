@@ -23,11 +23,21 @@ import (
 )
 
 // -----------------------------------------------------------------------------
+// Глобальная переменная для доступа к модели
+// -----------------------------------------------------------------------------
+var globalModel *model
+
+// -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 
+type ProcessConfig struct {
+	CmdLine     string `json:"cmd_line"`
+	AutoRestart bool   `json:"auto_restart"`
+}
+
 type Config struct {
-	Processes []string `json:"processes"`
+	Processes []ProcessConfig `json:"processes"`
 }
 
 // -----------------------------------------------------------------------------
@@ -35,10 +45,11 @@ type Config struct {
 // -----------------------------------------------------------------------------
 
 type ProcessItem struct {
-	CmdLine  string
-	Logs     []string
-	Cmd      *exec.Cmd
-	Finished bool
+	CmdLine     string
+	AutoRestart bool
+	Logs        []string
+	Cmd         *exec.Cmd
+	Finished    bool
 
 	stdout io.ReadCloser
 	stderr io.ReadCloser
@@ -71,15 +82,13 @@ type customDelegate struct {
 func (d customDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
 	item, ok := listItem.(processListItem)
 	if !ok {
-		// Для элементов, отличных от processListItem, используем поведение по умолчанию
 		d.DefaultDelegate.Render(w, m, index, listItem)
 		return
 	}
 
 	str := item.Title()
-	// Добавляем крестик во второй столбец, если он активен
 	if d.selectionColumn == 1 {
-		str += "   [x]" // отступ перед крестиком
+		str += "   [x]"
 	}
 
 	var out string
@@ -127,17 +136,17 @@ type model struct {
 	justEnteredLogs bool
 	program         *tea.Program
 
-	// Храним наш кастомный делегат в модели
 	delegate        customDelegate
 	selectionColumn int
 
-	// We store current window size
+	newProcAutoRestart bool
+
 	windowWidth  int
 	windowHeight int
 }
 
 // -----------------------------------------------------------------------------
-// Константы и функции (оставляем без изменений)
+// Константы и функции
 // -----------------------------------------------------------------------------
 
 const maxLogLines = 1000
@@ -171,7 +180,7 @@ func saveConfig(path string, cfg *Config) error {
 }
 
 func createDefaultConfig(path string) (*Config, error) {
-	cfg := &Config{Processes: []string{}}
+	cfg := &Config{Processes: []ProcessConfig{}}
 	if err := saveConfig(path, cfg); err != nil {
 		return nil, err
 	}
@@ -187,51 +196,92 @@ func appendLog(p *ProcessItem, line string) {
 	}
 }
 
-func startProcess(program *tea.Program, processIndex int, cmdLine string) (*ProcessItem, error) {
+func startProcess(program *tea.Program, processIndex int, cmdLine string, autoRestart bool) (*ProcessItem, error) {
 	parts := strings.Fields(cmdLine)
 	if len(parts) == 0 {
 		return nil, errors.New("empty command line")
 	}
 
-	cmd := exec.Command(parts[0], parts[1:]...)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-
+	var startSingleProcess func() error
 	pItem := &ProcessItem{
-		CmdLine: cmdLine,
-		Cmd:     cmd,
-		stdout:  stdout,
-		stderr:  stderr,
-		Logs:    []string{},
+		CmdLine:     cmdLine,
+		AutoRestart: autoRestart,
+		Logs:        []string{},
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
+	startSingleProcess = func() error {
+		cmd := exec.Command(parts[0], parts[1:]...)
 
-	go pItem.readOutput(program, processIndex, stdout)
-	go pItem.readOutput(program, processIndex, stderr)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stdout pipe: %v", err)
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stderr pipe: %v", err)
+		}
 
-	go func() {
-		_ = cmd.Wait()
 		pItem.mu.Lock()
-		pItem.Finished = true
+		pItem.Cmd = cmd
+		pItem.stdout = stdout
+		pItem.stderr = stderr
+		pItem.Finished = false
 		pItem.mu.Unlock()
 
-		appendLog(pItem, "[Process finished]")
-	}()
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start process: %v", err)
+		}
+
+		outputDone := &sync.WaitGroup{}
+		outputDone.Add(2)
+
+		go func() {
+			defer outputDone.Done()
+			if err := pItem.readOutput(program, processIndex, stdout); err != nil {
+				appendLog(pItem, fmt.Sprintf("[Error reading stdout: %v]", err))
+			}
+		}()
+
+		go func() {
+			defer outputDone.Done()
+			if err := pItem.readOutput(program, processIndex, stderr); err != nil {
+				appendLog(pItem, fmt.Sprintf("[Error reading stderr: %v]", err))
+			}
+		}()
+
+		go func() {
+			_ = cmd.Wait()
+			outputDone.Wait()
+
+			pItem.mu.Lock()
+			pItem.Finished = true
+			pItem.mu.Unlock()
+
+			appendLog(pItem, "[Process finished]")
+
+			if pItem.AutoRestart {
+				appendLog(pItem, "[Attempting to restart process...]")
+				time.Sleep(time.Second)
+
+				if err := startSingleProcess(); err != nil {
+					appendLog(pItem, fmt.Sprintf("[Failed to restart process: %v]", err))
+				} else {
+					appendLog(pItem, "[Process restarted successfully]")
+				}
+			}
+		}()
+
+		return nil
+	}
+
+	if err := startSingleProcess(); err != nil {
+		return nil, err
+	}
 
 	return pItem, nil
 }
 
-func (p *ProcessItem) readOutput(program *tea.Program, processIndex int, r io.Reader) {
+func (p *ProcessItem) readOutput(program *tea.Program, processIndex int, r io.Reader) error {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -247,6 +297,8 @@ func (p *ProcessItem) readOutput(program *tea.Program, processIndex int, r io.Re
 			program.Send(logUpdateMsg{processIndex: processIndex})
 		}
 	}
+
+	return scanner.Err()
 }
 
 func initialModel(program *tea.Program) model {
@@ -264,20 +316,29 @@ func initialModel(program *tea.Program) model {
 			log.Fatal("Failed to create config:", err)
 		}
 	} else if err != nil {
-		log.Fatal("Failed to load config:", err)
+		// Если не удалось прочитать существующий конфиг, переименовываем его
+		backupPath := configPath + ".old"
+		renameErr := os.Rename(configPath, backupPath)
+		if renameErr != nil {
+			log.Fatalf("Failed to rename invalid config: %v", renameErr)
+		}
+		log.Printf("Invalid config renamed to %s", backupPath)
+		cfg, err = createDefaultConfig(configPath)
+		if err != nil {
+			log.Fatal("Failed to create new config:", err)
+		}
 	}
 
 	var processes []*ProcessItem
-	for i, cmdLine := range cfg.Processes {
-		pItem, err := startProcess(nil, i, cmdLine)
+	for i, procCfg := range cfg.Processes {
+		pItem, err := startProcess(nil, i, procCfg.CmdLine, procCfg.AutoRestart)
 		if err != nil {
-			log.Printf("Error starting '%s': %v\n", cmdLine, err)
+			log.Printf("Error starting '%s': %v\n", procCfg.CmdLine, err)
 			continue
 		}
 		processes = append(processes, pItem)
 	}
 
-	// Инициализируем кастомный делегат с начальным столбцом 0
 	delegate := customDelegate{
 		DefaultDelegate: list.NewDefaultDelegate(),
 		selectionColumn: 0,
@@ -290,7 +351,7 @@ func initialModel(program *tea.Program) model {
 	items = append(items, newProcessItem{})
 
 	l := list.New(items, delegate, 50, 12)
-	l.Title = "Quardexus Process Manager v0.2"
+	l.Title = "Quardexus Process Manager v1.0 [beta]"
 	l.SetShowHelp(true)
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(true)
@@ -318,6 +379,7 @@ func initialModel(program *tea.Program) model {
 		program:             program,
 		delegate:            delegate,
 		selectionColumn:     0,
+		newProcAutoRestart:  true,
 		windowWidth:         0,
 		windowHeight:        0,
 	}
@@ -346,17 +408,14 @@ func (m *model) removeProcess(index int) {
 	if index < 0 || index >= len(m.processes) {
 		return
 	}
-	// Завершаем процесс, если он ещё работает
 	proc := m.processes[index]
 	if !proc.Finished && proc.Cmd != nil && proc.Cmd.Process != nil {
 		_ = proc.Cmd.Process.Kill()
 		appendLog(proc, "[Process killed for removal]")
 	}
 
-	// Удаляем из среза процессов
 	m.processes = append(m.processes[:index], m.processes[index+1:]...)
 
-	// Обновляем список элементов
 	var newItems []list.Item
 	for _, pr := range m.processes {
 		newItems = append(newItems, processListItem{p: pr})
@@ -364,25 +423,29 @@ func (m *model) removeProcess(index int) {
 	newItems = append(newItems, newProcessItem{})
 	m.list.SetItems(newItems)
 
-	// Обновляем конфигурацию
 	cfg, err := loadConfig(m.configPath)
-	if err == nil {
-		// Перестраиваем список команд из текущих процессов
-		var cmds []string
-		for _, p := range m.processes {
-			cmds = append(cmds, p.CmdLine)
-		}
-		cfg.Processes = cmds
-		_ = saveConfig(m.configPath, cfg)
+	if err != nil {
+		log.Println("Error loading config:", err)
+		return
+	}
+
+	var procs []ProcessConfig
+	for _, p := range m.processes {
+		procs = append(procs, ProcessConfig{
+			CmdLine:     p.CmdLine,
+			AutoRestart: p.AutoRestart,
+		})
+	}
+	cfg.Processes = procs
+	if err := saveConfig(m.configPath, cfg); err != nil {
+		log.Println("Error saving config:", err)
+	} else {
+		log.Println("Configuration saved successfully after removal.")
 	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.state {
-
-	// -----------------------------------------------------------------
-	//  stateList
-	// -----------------------------------------------------------------
 	case stateList:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -404,27 +467,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "enter":
-				// Если выбран второй столбец и элемент - процесс, завершаем и удаляем
 				if m.selectionColumn == 1 {
 					idx := m.list.Index()
 					if idx >= 0 && idx < len(m.list.Items()) {
 						switch m.list.Items()[idx].(type) {
 						case processListItem:
 							m.removeProcess(idx)
-							// Сброс столбца после удаления
 							m.selectionColumn = 0
 							m.delegate.selectionColumn = 0
 							m.list.SetDelegate(m.delegate)
 							return m, nil
 						case newProcessItem:
-							// Если выбран "[Create a new process]", переходим к его созданию
 							m.state = stateAddProcess
 							m.textInput.SetValue("")
+							m.newProcAutoRestart = true
 							return m, nil
 						}
 					}
 				} else {
-					// Обычное поведение Enter в первом столбце
 					idx := m.list.Index()
 					if idx < 0 || idx >= len(m.list.Items()) {
 						return m, nil
@@ -435,6 +495,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					case newProcessItem:
 						m.state = stateAddProcess
 						m.textInput.SetValue("")
+						m.newProcAutoRestart = true
 						return m, nil
 
 					case processListItem:
@@ -475,9 +536,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list, _ = m.list.Update(msg)
 		return m, nil
 
-	// -----------------------------------------------------------------
-	//  stateAddProcess
-	// -----------------------------------------------------------------
 	case stateAddProcess:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -493,14 +551,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				cmdLine := strings.TrimSpace(m.textInput.Value())
 				if cmdLine != "" {
-					pItem, err := startProcess(m.program, len(m.processes), cmdLine)
+					pItem, err := startProcess(m.program, len(m.processes), cmdLine, m.newProcAutoRestart)
 					if err == nil {
 						m.processes = append(m.processes, pItem)
-						// Добавляем новый процесс в конфигурацию
+
 						cfg, err := loadConfig(m.configPath)
-						if err == nil {
-							cfg.Processes = append(cfg.Processes, cmdLine)
-							_ = saveConfig(m.configPath, cfg)
+						if err != nil {
+							log.Println("Error loading config:", err)
+						} else {
+							cfg.Processes = append(cfg.Processes, ProcessConfig{
+								CmdLine:     cmdLine,
+								AutoRestart: m.newProcAutoRestart,
+							})
+							if err := saveConfig(m.configPath, cfg); err != nil {
+								log.Println("Error saving config:", err)
+							} else {
+								log.Println("Configuration saved successfully after adding process.")
+							}
 						}
 
 						var newItems []list.Item
@@ -527,6 +594,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.state = stateList
 				return m, nil
+
+			case "tab":
+				m.newProcAutoRestart = !m.newProcAutoRestart
+				return m, nil
 			}
 
 		case tickMsg:
@@ -541,9 +612,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textInput, _ = m.textInput.Update(msg)
 		return m, nil
 
-	// -----------------------------------------------------------------
-	//  stateViewLogs
-	// -----------------------------------------------------------------
 	case stateViewLogs:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -637,10 +705,15 @@ func (m model) View() string {
 		return m.list.View()
 
 	case stateAddProcess:
+		checkbox := "[ ]"
+		if m.newProcAutoRestart {
+			checkbox = "[x]"
+		}
 		return lipgloss.NewStyle().Padding(1, 2).Render(
 			fmt.Sprintf(
-				"Enter a command for a new process:\n\n%s\n\n(Enter – start, Esc – cancel, q/ctrl+c – quit)",
+				"Enter a command for a new process:\n\n%s\n\nAuto-restart: %s (Tab to toggle)\n\n(Enter – start, Esc – cancel, q/ctrl+c – quit)",
 				m.textInput.View(),
+				checkbox,
 			),
 		)
 
@@ -664,10 +737,6 @@ func (m model) View() string {
 
 	return "Unknown state"
 }
-
-// -----------------------------------------------------------------------------
-// Остальные вспомогательные функции без изменений
-// -----------------------------------------------------------------------------
 
 func (m model) updateLogsViewport(forceGotoBottom bool) model {
 	if m.currentProcessIndex < 0 || m.currentProcessIndex >= len(m.processes) {
@@ -709,15 +778,6 @@ func cp866ToUTF8(s string) (string, error) {
 
 func (m *model) SetProgram(p *tea.Program) {
 	m.program = p
-
-	for i, proc := range m.processes {
-		if proc.stdout != nil {
-			go proc.readOutput(p, i, proc.stdout)
-		}
-		if proc.stderr != nil {
-			go proc.readOutput(p, i, proc.stderr)
-		}
-	}
 }
 
 func main() {
@@ -731,6 +791,8 @@ func main() {
 		m,
 		tea.WithAltScreen(),
 	)
+
+	globalModel = &m
 
 	m.SetProgram(p)
 

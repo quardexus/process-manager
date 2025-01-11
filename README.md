@@ -8,6 +8,7 @@
 - Add new processes during runtime.
 - View logs of running processes with scrolling and force-kill functionality.
 - Limits log size per process (up to 1000 lines) to prevent excessive memory usage.
+- Automatically backs up and resets the configuration file if it becomes unreadable.
 
 ## Requirements
 
@@ -55,25 +56,35 @@
 
 2. **Configuration File:**
 
-   The `process_manager_config.json` file holds a list of commands for processes to be launched automatically. Its format:
+   The `process_manager_config.json` file holds a list of processes to be launched automatically. Its format:
 
    ```json
    {
      "processes": [
-       "command_1",
-       "command_2"
+       {
+         "cmd_line": "command_1",
+         "auto_restart": true
+       },
+       {
+         "cmd_line": "command_2",
+         "auto_restart": false
+       }
      ]
    }
    ```
 
-   You can manually add or modify commands in this file before starting the application.
+   - **cmd_line:** The command line to execute the process.
+   - **auto_restart:** If set to `true`, the process will automatically restart upon termination.
+
+   **Note:**  
+   If the configuration file cannot be read (due to corruption or invalid format), the application will rename the existing `process_manager_config.json` to `process_manager_config.json.old` and create a new default configuration file.
 
 3. **Application Interface:**
 
    - **Process List:** Upon launch, the interface displays a list of running processes. The last item in the list allows you to create a new process.
-   - **Adding a Process:** Select the option to create a new process, enter the command, and press `Enter`.
+   - **Adding a Process:** Select the option to create a new process, enter the command, and press `Enter`. You can toggle the auto-restart option by pressing `Tab`.
    - **Viewing Logs:** Select an existing process from the list and press `Enter` to view its logs. In log view mode:
-     - Use the `↑/↓` arrow keys to scroll.
+     - Use the `↑/↓` arrow keys or `k/j` to scroll.
      - Press `ctrl+k` to forcefully kill the process.
      - Press `Esc` to return to the process list.
    - **Exit:** Press `q` or `ctrl+c` to quit the application. All unfinished processes will be terminated gracefully.
