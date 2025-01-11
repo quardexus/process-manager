@@ -6,6 +6,7 @@
 
 - Automatically launches processes from a configuration file on startup.
 - Add new processes during runtime.
+- Automatic Restart: If a process unexpectedly terminates or completes normally, it will be restarted automatically based on its configuration.
 - View logs of running processes with scrolling and force-kill functionality.
 - Limits log size per process (up to 1000 lines) to prevent excessive memory usage.
 - Automatically backs up and resets the configuration file if it becomes unreadable.
